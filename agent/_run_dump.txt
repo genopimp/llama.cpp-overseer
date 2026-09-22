@@ -1,0 +1,277 @@
+def run(args: argparse.Namespace) -> int:
+    root = Path(args.root).expanduser().resolve()
+    job_dir = Path(args.job_dir).expanduser().resolve() if args.job_dir else (Path(__file__).resolve().parents[1] / "jobs" / "active")
+    job_dir.mkdir(parents=True, exist_ok=True)
+    stop_path = job_dir / "STOP"
+    if stop_path.is_file():
+        stop_path.unlink()
+
+    ws = Workspace(root)
+    env = build_env()
+    client = Client(args.api)
+    tools = Tools(ws, env, job_dir)
+    state = load_state(job_dir, args.goal, str(root))
+    prev_status = state.get("status")
+    state["status"] = "running"
+    save_state(job_dir, state)
+    (job_dir / "overseer.pid").write_text(str(os.getpid()), encoding="utf-8")
+    log(job_dir, f"start pid={os.getpid()} goal={state.get('goal')!r} root={root} prev={prev_status}")
+    dialogue(
+        job_dir,
+        "system",
+        "Overseer "
+        + ("resumed" if prev_status else "started")
+        + f".\nOriginal goal: {state.get('goal')}\nWorkspace: {root}"
+        + (f"\nLast build: {state.get('artifact')}" if state.get("artifact") else "")
+        + (f"\nNew work this session: {state.get('latest_request')}" if state.get("latest_request") and state.get("request_consumed") != state.get("latest_request") else ""),
+    )
+    codeview(job_dir, "reset", reason="session", title="job start")
+
+    deadline = time.time() + args.max_minutes * 60
+    cycles = 0
+    while time.time() < deadline:
+        if stop_requested(job_dir):
+            state["status"] = "stopped"
+            save_state(job_dir, state)
+            log(job_dir, "stopped by STOP file")
+            return 0
+        cycles += 1
+        if cycles > args.max_cycles:
+            state["status"] = "blocked"
+            state["notes"] = (state.get("notes") or "") + "\nHit max cycles."
+            save_state(job_dir, state)
+            log(job_dir, "max cycles")
+            return 2
+
+        extra = human_notes(job_dir)
+        build_mode = human_wants_build(extra)
+        if build_mode:
+            do_compile(job_dir, state, ws, env, run_after=(build_mode == "run"))
+
+        req = (state.get("latest_request") or "").strip()
+        if req and state.get("request_consumed") != req:
+            log(job_dir, "overseer adding work for latest request")
+            ctx = (
+                (extra + "\n\n" if extra else "")
+                + "CONTINUING PROJECT. Do not redo completed tasks unless they are broken.\n"
+                + f"Original goal: {state.get('goal')}\n"
+                + f"New work requested:\n{req}\n"
+                + "Reply with action=plan and only the NEW pending tasks."
+            )
+            decision = resolve_asks(
+                client, job_dir, state, ask_overseer(client, state, ctx, job_dir), ctx
+            )
+            if decision.get("action") == "plan" and decision.get("tasks"):
+                existing = {t["id"] for t in state.get("plan") or []}
+                added = []
+                for i, t in enumerate(decision["tasks"], 1):
+                    tid = str(t.get("id") or f"n{len(state.get('plan') or []) + i}")
+                    if tid in existing:
+                        tid = f"{tid}.{i}"
+                    item = {
+                        "id": tid,
+                        "title": t.get("title") or tid,
+                        "detail": t.get("detail") or "",
+                        "status": "pending",
+                    }
+                    state.setdefault("plan", []).append(item)
+                    added.append(item)
+                if decision.get("notes"):
+                    state["notes"] = decision["notes"][:4000]
+                state["request_consumed"] = req
+                save_state(job_dir, state)
+                dialogue(
+                    job_dir,
+                    "overseer",
+                    "Added work:\n" + "\n".join(f"- {t['id']} {t['title']}" for t in added),
+                )
+                continue
+            state["request_consumed"] = req
+            save_state(job_dir, state)
+
+        if not state.get("plan"):
+            log(job_dir, "overseer planning")
+            ctx = (extra + "\n\n" if extra else "") + "No plan yet. Create a bite-size plan for the goal."
+            decision = resolve_asks(
+                client,
+                job_dir,
+                state,
+                ask_overseer(client, state, ctx, job_dir),
+                ctx,
+            )
+            if decision.get("action") == "plan" and decision.get("tasks"):
+                tasks = []
+                for i, t in enumerate(decision["tasks"], 1):
+                    tid = str(t.get("id") or f"t{i}")
+                    tasks.append(
+                        {
+                            "id": tid,
+                            "title": t.get("title") or tid,
+                            "detail": t.get("detail") or "",
+                            "status": "pending",
+                        }
+                    )
+                state["plan"] = tasks
+                if decision.get("notes"):
+                    state["notes"] = decision["notes"]
+                save_state(job_dir, state)
+                log(job_dir, f"plan with {len(tasks)} tasks")
+                dialogue(
+                    job_dir,
+                    "overseer",
+                    "Plan:\n" + "\n".join(f"- {t['id']} {t['title']}" for t in tasks),
+                )
+                continue
+            state["status"] = "blocked"
+            state["block_reason"] = decision.get("reason") or "planning failed"
+            save_state(job_dir, state)
+            log(job_dir, "planning failed: " + json.dumps(decision)[:400])
+            return 3
+
+        task = next_pending(state)
+        if task is None:
+            log(job_dir, "overseer review (queue empty)")
+            ctx = (
+                (extra + "\n\n" if extra else "")
+                + "All current tasks are done. If the human asked for more work, add pending tasks. "
+                "If they asked to compile or run, they already got that from the controller — do not add a build task. "
+                "Otherwise action=finish to idle (no compile)."
+            )
+            decision = resolve_asks(
+                client,
+                job_dir,
+                state,
+                ask_overseer(client, state, ctx, job_dir),
+                ctx,
+            )
+            action = decision.get("action")
+            if action == "finish":
+                mark_done(job_dir, state, decision.get("summary") or "")
+                return 0
+            if action == "plan" and decision.get("tasks"):
+                existing = {t["id"] for t in state["plan"]}
+                for i, t in enumerate(decision["tasks"], 1):
+                    tid = str(t.get("id") or f"t{len(state['plan']) + i}")
+                    if tid in existing:
+                        tid = f"{tid}.{i}"
+                    state["plan"].append(
+                        {
+                            "id": tid,
+                            "title": t.get("title") or tid,
+                            "detail": t.get("detail") or "",
+                            "status": "pending",
+                        }
+                    )
+                save_state(job_dir, state)
+                continue
+            if action == "block":
+                state["status"] = "blocked"
+                state["block_reason"] = decision.get("reason") or "blocked"
+                save_state(job_dir, state)
+                dialogue(job_dir, "overseer", "Blocked: " + state["block_reason"])
+                log(job_dir, "blocked: " + state["block_reason"])
+                return 4
+            time.sleep(8)
+            continue
+
+        task["status"] = "running"
+        state["current"] = task["id"]
+        save_state(job_dir, state)
+        log(job_dir, f"dispatch {task['id']} {task['title']}")
+        dialogue(job_dir, "overseer", f"Starting {task['id']}: {task['title']}")
+        codeview(job_dir, "reset", reason="task", task=task["id"], title=task.get("title") or task["id"])
+        try:
+            result = run_worker(client, tools, state, task, job_dir)
+        except httpx.HTTPError as e:
+            log(job_dir, f"API error: {e}")
+            time.sleep(5)
+            task["status"] = "retry"
+            save_state(job_dir, state)
+            continue
+        except subprocess.TimeoutExpired:
+            result = {"status": "need_split", "summary": "command timed out", "files": []}
+        except Exception as e:
+            log(job_dir, "worker crash: " + traceback.format_exc())
+            result = {"status": "blocked", "summary": str(e), "files": []}
+
+        log(job_dir, f"handoff {task['id']} {result.get('status')}: {str(result.get('summary'))[:300]}")
+        dialogue(
+            job_dir,
+            "worker",
+            f"{task['id']} {task['title']} → {result.get('status')}\n{result.get('summary') or ''}",
+        )
+        state.setdefault("history", []).append(
+            {"task": task["id"], "status": result.get("status"), "summary": result.get("summary"), "at": utc_now()}
+        )
+
+        extra_after = human_notes(job_dir)
+        ctx = (
+            (extra_after + "\n\n" if extra_after else "")
+            + f"Worker finished task {task['id']} ({task['title']}).\n"
+            + f"status={result.get('status')}\n"
+            + f"summary={result.get('summary')}\n"
+            + f"files={result.get('files')}\n"
+            + "Accept if good, retry with a sharper instruction, split if too large, ask the human if needed, or block."
+        )
+        decision = resolve_asks(
+            client,
+            job_dir,
+            state,
+            ask_overseer(client, state, ctx, job_dir),
+            ctx,
+        )
+        action = decision.get("action") or "accept"
+        if decision.get("notes"):
+            state["notes"] = decision["notes"][:4000]
+
+        if action == "retry":
+            task["status"] = "retry"
+            if decision.get("instruction"):
+                task["detail"] = (task.get("detail") or "") + "\nRETRY: " + decision["instruction"]
+        elif action == "split" and decision.get("tasks"):
+            task["status"] = "split"
+            for i, t in enumerate(decision["tasks"], 1):
+                state["plan"].append(
+                    {
+                        "id": str(t.get("id") or f"{task['id']}.{i}"),
+                        "title": t.get("title") or f"split {i}",
+                        "detail": t.get("detail") or "",
+                        "status": "pending",
+                    }
+                )
+        elif action == "block":
+            task["status"] = "failed"
+            state["status"] = "blocked"
+            state["block_reason"] = decision.get("reason") or result.get("summary")
+            save_state(job_dir, state)
+            dialogue(job_dir, "overseer", "Blocked: " + str(state["block_reason"]))
+            log(job_dir, "blocked after worker: " + state["block_reason"])
+            return 4
+        elif action == "finish":
+            task["status"] = "done"
+            mark_done(job_dir, state, decision.get("summary") or "")
+            return 0
+        else:
+            if result.get("status") == "blocked":
+                task["status"] = "failed"
+                state["status"] = "blocked"
+                state["block_reason"] = result.get("summary")
+                save_state(job_dir, state)
+                return 4
+            if result.get("status") == "need_split":
+                task["status"] = "retry"
+                task["detail"] = (task.get("detail") or "") + "\nMake this smaller; previous attempt hit limits."
+            else:
+                task["status"] = "done"
+                task["summary"] = result.get("summary")
+                task["files"] = result.get("files")
+
+        state["current"] = None
+        save_state(job_dir, state)
+
+    state["status"] = "blocked"
+    state["block_reason"] = "time limit"
+    save_state(job_dir, state)
+    log(job_dir, "time limit")
+    return 5
+

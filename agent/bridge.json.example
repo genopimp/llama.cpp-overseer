@@ -1,0 +1,4 @@
+{
+  "telegram_token": "paste BotFather token here",
+  "xai_api_key": "optional — or set XAI_API_KEY. Without it the phone chat uses local Bonsai 27B as manager."
+}

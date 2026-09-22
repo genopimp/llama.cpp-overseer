@@ -1,0 +1,35 @@
+﻿# Secrets / local state
+.env
+**/.overseer/
+**/bridge_token.txt
+**/telegram_chat_id.txt
+**/state.json
+**/inbox.jsonl
+**/dialogue.jsonl
+**/llm_trace.jsonl
+**/*.pid
+**/STOP
+agent/bridge.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Backups / junk
+*.bak
+*.bak-*
+*.log
+logs/
+_publish/
+
+# Models (download separately — too large for git)
+models/
+*.gguf
+*.GGUF
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
